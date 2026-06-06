@@ -30,8 +30,7 @@ services:
       - ./logs:/app/logs
       - ./metadata:/app/metadata
     working_dir: /app
-    # Default command runs the full pipeline
-    command: ["python", "src/run_pipeline.py"]
+    command: ["src/run_pipeline.py"]
     # Resource limits suitable for 68M row processing
     deploy:
       resources:

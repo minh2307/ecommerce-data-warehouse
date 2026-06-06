@@ -5,7 +5,8 @@
 # Based on Python 3.11 with OpenJDK 17 (required by Spark 3.5).
 # =============================================================================
 
-FROM python:3.11-slim AS base
+FROM python:3.11-slim-bookworm AS base
+
 
 # Install Java (required by PySpark)
 RUN apt-get update && \

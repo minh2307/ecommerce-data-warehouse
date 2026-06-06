@@ -105,6 +105,7 @@ def run_pipeline() -> None:
     from src.build_dim_categories import run_dim_categories
     from src.build_dim_products_scd2 import run_dim_products_scd2
     from src.build_fact_events import run_fact_events
+    from src.load_gold_to_bigquery import run_bigquery_load
 
     # Define pipeline steps in execution order
     # Order matters: dimensions must be built before the fact table
@@ -115,6 +116,7 @@ def run_pipeline() -> None:
         ("Phase 3: Dimension Categories (Gold)", run_dim_categories),
         ("Phase 4: SCD Type 2 Products (Gold)", run_dim_products_scd2),
         ("Phase 5: Fact Events (Gold)", run_fact_events),
+        ("Phase 6: Load Gold Layer to BigQuery", run_bigquery_load),
     ]
 
     total_steps = len(steps)

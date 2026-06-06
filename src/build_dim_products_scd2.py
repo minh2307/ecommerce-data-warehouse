@@ -54,29 +54,54 @@ def extract_product_timeline(df: DataFrame) -> DataFrame:
     """
     Extract the timeline of product attribute changes from Silver events.
 
-    For each product, get the first occurrence of each unique combination
-    of (product_id, category_id, brand, price) ordered by event_time.
+    For each product, get the records where price, category_id, or brand changes
+    chronologically.
 
     Args:
         df: Silver layer events DataFrame.
 
     Returns:
-        DataFrame with one row per product-attribute combination,
+        DataFrame with one row per product-attribute change,
         ordered chronologically.
-
-    Design Decision:
-        We track the earliest event_time for each unique attribute
-        combination rather than every single event. This reduces
-        68M event rows to a manageable number of product versions.
     """
     logger.info("Extracting product attribute timeline...")
 
-    # Get the earliest timestamp for each unique product attribute combination
-    product_versions = (
+    # Define window ordered by event_time per product
+    window_spec = Window.partitionBy("product_id").orderBy("event_time")
+
+    # Lag values of attributes
+    df_lagged = (
         df
-        .groupBy("product_id", "category_id", "brand", "price")
-        .agg(F.min("event_time").alias("first_seen"))
-        .orderBy("product_id", "first_seen")
+        .withColumn("prev_price", F.lag("price").over(window_spec))
+        .withColumn("prev_category_id", F.lag("category_id").over(window_spec))
+        .withColumn("prev_brand", F.lag("brand").over(window_spec))
+    )
+
+    # A change occurred if it's the first record or any attribute has changed
+    df_changes = df_lagged.withColumn(
+        "is_change",
+        F.when(
+            F.col("prev_price").isNull() |
+            F.col("prev_category_id").isNull() |
+            F.col("prev_brand").isNull() |
+            (~F.col("price").eqNullSafe(F.col("prev_price"))) |
+            (~F.col("category_id").eqNullSafe(F.col("prev_category_id"))) |
+            (~F.col("brand").eqNullSafe(F.col("prev_brand"))),
+            F.lit(1)
+        ).otherwise(F.lit(0))
+    )
+
+    # Filter to keep only the change events and rename event_time to first_seen
+    product_versions = (
+        df_changes
+        .filter(F.col("is_change") == 1)
+        .select(
+            "product_id",
+            "category_id",
+            "brand",
+            "price",
+            F.col("event_time").alias("first_seen")
+        )
     )
 
     count = product_versions.count()
@@ -90,7 +115,7 @@ def detect_changes_and_build_scd2(df: DataFrame) -> DataFrame:
 
     Logic:
         1. Order product versions chronologically per product_id
-        2. Use lag() to detect when price changes between consecutive versions
+        2. Use lag() to detect when price/brand/category changes between consecutive versions
         3. Create version groups using cumulative sum of change flags
         4. Generate valid_from (start of version validity)
         5. Generate valid_to (end of version validity, NULL for current)
@@ -101,40 +126,35 @@ def detect_changes_and_build_scd2(df: DataFrame) -> DataFrame:
 
     Returns:
         SCD Type 2 DataFrame with version tracking columns.
-
-    Design Decision:
-        Window functions are used instead of self-joins for detecting
-        changes. This is more memory-efficient and leverages Spark's
-        optimized sort-based window implementation.
     """
     logger.info("Building SCD Type 2 with change detection...")
 
     # Step 1: Define window ordered by first_seen timestamp per product
     product_window = Window.partitionBy("product_id").orderBy("first_seen")
 
-    # Step 2: Detect price changes using lag()
-    # Compare current price with previous price for the same product.
-    # If different (or first record), this starts a new version.
-    df_with_lag = df.withColumn(
-        "prev_price",
-        F.lag("price").over(product_window),
+    # Step 2: Detect changes using lag()
+    df_with_lag = (
+        df
+        .withColumn("prev_price", F.lag("price").over(product_window))
+        .withColumn("prev_category_id", F.lag("category_id").over(product_window))
+        .withColumn("prev_brand", F.lag("brand").over(product_window))
     )
 
     # Step 3: Create change flag
-    # A new version starts when:
-    # - It's the first record for this product (prev_price IS NULL)
-    # - The price has changed from the previous version
     df_with_changes = df_with_lag.withColumn(
         "is_new_version",
         F.when(
-            F.col("prev_price").isNull() | (F.col("price") != F.col("prev_price")),
+            F.col("prev_price").isNull() |
+            F.col("prev_category_id").isNull() |
+            F.col("prev_brand").isNull() |
+            (~F.col("price").eqNullSafe(F.col("prev_price"))) |
+            (~F.col("category_id").eqNullSafe(F.col("prev_category_id"))) |
+            (~F.col("brand").eqNullSafe(F.col("prev_brand"))),
             F.lit(1),
         ).otherwise(F.lit(0)),
     )
 
     # Step 4: Create version groups using cumulative sum
-    # Each time is_new_version = 1, a new group starts.
-    # Records within the same group have the same price.
     df_with_groups = df_with_changes.withColumn(
         "version_group",
         F.sum("is_new_version").over(product_window),
