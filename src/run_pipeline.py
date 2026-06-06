@@ -136,6 +136,14 @@ def run_pipeline() -> None:
         for i, (name, func) in enumerate(steps, 1):
             run_step(name, func, i, total_steps)
             completed += 1
+            
+            # Reclaim disk space on constrained environments by deleting raw CSV after ingestion
+            if name == "Phase 1: Data Ingestion (Bronze)" and os.getenv("CLEANUP_RAW_DATA", "false").lower() == "true":
+                raw_csv = os.path.join("data", "raw", "events.csv")
+                if os.path.exists(raw_csv):
+                    logger.info("CLEANUP_RAW_DATA is enabled. Deleting raw CSV to reclaim disk space...")
+                    os.remove(raw_csv)
+                    logger.info("✅ Raw CSV file deleted. Disk space reclaimed successfully!")
 
     except Exception:
         logger.error(

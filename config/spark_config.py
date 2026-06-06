@@ -91,6 +91,11 @@ def get_spark_config() -> dict[str, str]:
 
         # Enable predicate pushdown for Parquet to skip irrelevant row groups.
         "spark.sql.parquet.filterPushdown": "true",
+
+        # --- Local Scratch Directory ---
+        # Set local scratch directory to a folder inside the mounted /app/data volume
+        # to prevent filling up the root partition '/' (which has very limited space).
+        "spark.local.dir": "/app/data/tmp",
     }
 
 

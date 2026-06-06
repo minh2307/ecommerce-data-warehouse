@@ -29,6 +29,8 @@ services:
       # Mount logs and metadata for observability
       - ./logs:/app/logs
       - ./metadata:/app/metadata
+      # Mount credentials for Google Cloud
+      - ./credentials:/app/credentials
     working_dir: /app
     command: ["src/run_pipeline.py"]
     # Resource limits suitable for 68M row processing
