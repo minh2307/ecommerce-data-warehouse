@@ -1,0 +1,41 @@
+version: "3.8"
+
+# =============================================================================
+# Web Analytics ETL - Docker Compose
+# =============================================================================
+# Provides a Spark local mode environment for processing 68M rows of
+# web analytics data through the Medallion Architecture pipeline.
+#
+# Usage:
+#   docker compose build
+#   docker compose run --rm spark-etl python src/run_pipeline.py
+# =============================================================================
+
+services:
+  spark-etl:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: web-analytics-etl
+    env_file:
+      - .env
+    volumes:
+      # Mount source code for development (hot reload)
+      - ./src:/app/src
+      - ./config:/app/config
+      - ./tests:/app/tests
+      # Mount data directory for persistence
+      - ./data:/app/data
+      # Mount logs and metadata for observability
+      - ./logs:/app/logs
+      - ./metadata:/app/metadata
+    working_dir: /app
+    # Default command runs the full pipeline
+    command: ["python", "src/run_pipeline.py"]
+    # Resource limits suitable for 68M row processing
+    deploy:
+      resources:
+        limits:
+          memory: 8g
+        reservations:
+          memory: 4g

@@ -1,0 +1,17 @@
+# =============================================================================
+# Web Analytics ETL - Dependencies
+# =============================================================================
+# PySpark 3.x for distributed data processing (68M rows)
+pyspark==3.5.4
+
+# PyArrow for efficient Parquet I/O and columnar data handling
+pyarrow==18.1.0
+
+# Google Drive download utility for raw data ingestion
+gdown==5.2.0
+
+# Testing framework
+pytest==8.3.4
+
+# Environment variable management
+python-dotenv==1.0.1

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "data-engineer": {
+      "source": "sickn33/antigravity-awesome-skills",
+      "sourceType": "github",
+      "skillPath": "skills/data-engineer/SKILL.md",
+      "computedHash": "0cbff8cab74971202adee0bd3c4f62ab79c3a25e7ab05cc19564185fa0baa2bd"
+    }
+  }
+}
