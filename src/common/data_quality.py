@@ -122,23 +122,18 @@ def validate_nulls(
     fail_on_nulls: bool = True,
 ) -> dict[str, Any]:
     """
-    Check for null values in critical columns.
-
-    Args:
-        df: PySpark DataFrame to validate.
-        critical_columns: Columns that should not contain nulls.
-        stage_name: Name of the ETL stage.
-        fail_on_nulls: If True, raise error when nulls are found.
-
-    Returns:
-        Validation result with null counts per column.
+    Check for null values in critical columns using a single optimized scan.
     """
     null_counts = {}
-    for col_name in critical_columns:
-        if col_name in df.columns:
-            null_count = df.filter(F.col(col_name).isNull()).count()
-            null_counts[col_name] = null_count
-
+    valid_cols = [c for c in critical_columns if c in df.columns]
+    
+    if valid_cols:
+        agg_exprs = [F.sum(F.when(F.col(c).isNull(), 1).otherwise(0)).alias(c) for c in valid_cols]
+        agg_row = df.agg(*agg_exprs).collect()[0]
+        for c in valid_cols:
+            val = agg_row[c]
+            null_counts[c] = int(val) if val is not None else 0
+    
     has_nulls = any(v > 0 for v in null_counts.values())
     result = {
         "check": "null_validation",
@@ -255,49 +250,93 @@ def validate_primary_key(
 def generate_profiling_report(
     df: DataFrame,
     stage_name: str,
+    row_count: Optional[int] = None,
 ) -> dict[str, Any]:
     """
     Generate a data profiling report with row count, null counts,
     distinct counts, and data types for every column.
-
-    Args:
-        df: PySpark DataFrame to profile.
-        stage_name: Name of the ETL stage.
-
-    Returns:
-        Profiling report dictionary.
+    Uses a single optimized scan to support massive datasets.
     """
-    row_count = df.count()
+    if row_count is None:
+        row_count = df.count()
     column_profiles = []
 
-    for field in df.schema.fields:
-        col_name = field.name
-        col_type = str(field.dataType)
+    if row_count == 0:
+        for field in df.schema.fields:
+            column_profiles.append({
+                "column": field.name,
+                "data_type": str(field.dataType),
+                "null_count": 0,
+                "null_pct": 0.0,
+                "non_null_pct": 0.0,
+                "distinct_count": 0,
+            })
+    else:
+        # For huge datasets, sample data for profiling to prevent memory and disk space overflow.
+        # approx_count_distinct requires heavy shuffles and spills to disk.
+        sampled = False
+        sample_fraction = 1.0
+        profile_df = df
 
-        null_count = df.filter(F.col(col_name).isNull()).count()
-        distinct_count = df.select(col_name).distinct().count()
-        non_null_pct = round((1 - null_count / row_count) * 100, 2) if row_count > 0 else 0
+        if row_count > 2000000:
+            sampled = True
+            sample_fraction = 0.05
+            logger.info(
+                "[%s] Dataset is large (%s rows). Sampling %d%% for profiling to save memory/disk space.",
+                stage_name, f"{row_count:,}", int(sample_fraction * 100)
+            )
+            profile_df = df.sample(withReplacement=False, fraction=sample_fraction, seed=42)
 
-        column_profiles.append({
-            "column": col_name,
-            "data_type": col_type,
-            "null_count": null_count,
-            "null_pct": round(null_count / row_count * 100, 2) if row_count > 0 else 0,
-            "non_null_pct": non_null_pct,
-            "distinct_count": distinct_count,
-        })
+        # Build a single aggregation query for nulls and approx distinct counts
+        agg_exprs = []
+        for field in profile_df.schema.fields:
+            col_name = field.name
+            agg_exprs.append(F.sum(F.when(F.col(col_name).isNull(), 1).otherwise(0)).alias(f"{col_name}_null_count"))
+            agg_exprs.append(F.approx_count_distinct(col_name).alias(f"{col_name}_distinct_count"))
+
+        # Run aggregation in one scan
+        agg_row = profile_df.agg(*agg_exprs).collect()[0]
+
+        for field in profile_df.schema.fields:
+            col_name = field.name
+            col_type = str(field.dataType)
+
+            null_count = agg_row[f"{col_name}_null_count"]
+            null_count = int(null_count) if null_count is not None else 0
+
+            distinct_count = agg_row[f"{col_name}_distinct_count"]
+            distinct_count = int(distinct_count) if distinct_count is not None else 0
+
+            if sampled:
+                # Scale back counts to estimate overall numbers
+                null_count = min(int(null_count / sample_fraction), row_count)
+                distinct_count = min(int(distinct_count / sample_fraction), row_count)
+
+            null_pct = round(null_count / row_count * 100, 2)
+            non_null_pct = round((1 - null_count / row_count) * 100, 2)
+
+            column_profiles.append({
+                "column": col_name,
+                "data_type": col_type,
+                "null_count": null_count,
+                "null_pct": null_pct,
+                "non_null_pct": non_null_pct,
+                "distinct_count": distinct_count,
+            })
 
     report = {
         "stage": stage_name,
         "row_count": row_count,
         "column_count": len(df.columns),
         "columns": column_profiles,
+        "sampled": sampled,
+        "sample_fraction": sample_fraction,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
     logger.info(
-        "[%s] Profiling complete: %s rows, %d columns",
-        stage_name, f"{row_count:,}", len(df.columns),
+        "[%s] Profiling complete: %s rows, %d columns (sampled: %s)",
+        stage_name, f"{row_count:,}", len(df.columns), str(sampled),
     )
     return report
 

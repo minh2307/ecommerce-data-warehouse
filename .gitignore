@@ -68,3 +68,7 @@ gcp-key.json
 # Google Cloud Credentials
 # =============================================================================
 credentials/
+
+.agents
+
+prompt.md 

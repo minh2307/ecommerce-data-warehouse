@@ -85,13 +85,10 @@ def build_dim_categories(df: DataFrame) -> DataFrame:
         )
         .select("category_id", "category_code", "category_l1", "category_l2")
     )
-
-    count = dim_categories.count()
-    logger.info("dim_categories built: %s unique categories", f"{count:,}")
     return dim_categories
 
 
-def write_dim_categories(df: DataFrame, output_path: str) -> int:
+def write_dim_categories(df: DataFrame, output_path: str) -> tuple[DataFrame, int]:
     """
     Write dim_categories to Gold layer. NOT partitioned (small dimension table).
 
@@ -100,16 +97,18 @@ def write_dim_categories(df: DataFrame, output_path: str) -> int:
         output_path: Gold layer output directory.
 
     Returns:
-        Number of rows written.
+        Tuple of (df_written, row_count).
     """
     dim_path = os.path.join(output_path, "dim_categories.parquet")
     logger.info("Writing dim_categories to: %s", dim_path)
 
     df.write.mode("overwrite").parquet(dim_path)
 
-    row_count = df.count()
+    df_written = df.sparkSession.read.parquet(dim_path)
+    row_count = df_written.count()
     logger.info("dim_categories written: %s rows", f"{row_count:,}")
-    return row_count
+    return df_written, row_count
+
 
 
 def run_dim_categories() -> None:
@@ -132,15 +131,17 @@ def run_dim_categories() -> None:
 
             dim_categories = build_dim_categories(df)
 
+            # Step 4: Write first to avoid repeating aggregation shuffles
+            dim_categories_written, row_count = write_dim_categories(dim_categories, GOLD_DATA_PATH)
+            tracker.set_rows_processed(row_count)
+
+            # Step 3: Validate
             quality_results = []
-            row_result = validate_row_count(dim_categories, "dim_categories", min_rows=1)
+            row_result = validate_row_count(dim_categories_written, "dim_categories", min_rows=1)
             quality_results.append(row_result)
 
-            pk_result = validate_primary_key(dim_categories, "category_id", "dim_categories")
+            pk_result = validate_primary_key(dim_categories_written, "category_id", "dim_categories")
             quality_results.append(pk_result)
-
-            row_count = write_dim_categories(dim_categories, GOLD_DATA_PATH)
-            tracker.set_rows_processed(row_count)
 
             save_quality_report(quality_results, "dim_categories")
             logger.info("Phase 3 (dim_categories) completed successfully")

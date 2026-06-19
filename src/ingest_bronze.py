@@ -1,10 +1,10 @@
 """
 Phase 1: Data Ingestion (Bronze Layer)
 ======================================
-Reads raw CSV data from data/raw/, validates the schema, generates a
+Reads raw Parquet data from data/raw/, validates the schema, generates a
 profiling report, and writes to the Bronze layer as partitioned Parquet.
 
-Input:  data/raw/*.csv
+Input:  data/raw/events_raw.parquet
 Output: data/bronze/events_raw.parquet (partitioned by ingestion_date)
 
 Architecture Decision:
@@ -56,32 +56,29 @@ RAW_DATA_PATH = os.getenv("RAW_DATA_PATH", "data/raw")
 BRONZE_DATA_PATH = os.getenv("BRONZE_DATA_PATH", "data/bronze")
 
 
-def read_raw_csv(spark: SparkSession, input_path: str) -> DataFrame:
+def read_raw_parquet(spark: SparkSession, input_path: str) -> DataFrame:
     """
-    Read raw CSV files from the specified path.
+    Read raw Parquet file(s) from the specified path.
 
     Args:
         spark: Active SparkSession.
-        input_path: Path to directory containing CSV files.
+        input_path: Path to directory containing Parquet file(s).
 
     Returns:
-        Raw DataFrame with inferred string types.
+        Raw DataFrame with original types from Parquet.
 
     Design Decision:
-        All columns are read as strings initially (inferSchema=False)
-        to prevent type inference errors on 68M rows. Type casting
-        happens in the Silver layer (Phase 2).
+        Data is downloaded from Google Drive as Parquet via
+        gdrive_to_parquet.py (streamed CSV → Parquet with ZSTD).
+        Reading Parquet preserves exact types and avoids CSV schema
+        inference issues on 68M rows.
     """
-    logger.info("Reading CSV files from: %s", input_path)
+    logger.info("Reading Parquet files from: %s", input_path)
 
-    df = spark.read.csv(
-        input_path,
-        header=True,
-        inferSchema=False,  # Read all as strings for Bronze layer safety
-        multiLine=False,
-    )
+    df = spark.read.parquet(input_path)
 
-    logger.info("Raw CSV loaded: %d columns", len(df.columns))
+    logger.info("Raw Parquet loaded: %d columns, schema: %s",
+                len(df.columns), df.columns)
     return df
 
 
@@ -107,13 +104,14 @@ def add_ingestion_metadata(df: DataFrame) -> DataFrame:
     return df
 
 
-def write_bronze(df: DataFrame, output_path: str) -> int:
+def write_bronze(df: DataFrame, output_path: str, row_count: int) -> int:
     """
     Write DataFrame to Bronze layer as partitioned Parquet.
 
     Args:
         df: DataFrame with ingestion metadata.
         output_path: Output directory path.
+        row_count: Pre-calculated number of rows.
 
     Returns:
         Number of rows written.
@@ -128,7 +126,6 @@ def write_bronze(df: DataFrame, output_path: str) -> int:
 
     df.write.mode("overwrite").partitionBy("ingestion_date").parquet(bronze_path)
 
-    row_count = df.count()
     logger.info("Bronze layer written: %s rows", f"{row_count:,}")
     return row_count
 
@@ -146,12 +143,19 @@ def run_ingestion() -> None:
         6. Write to Bronze layer as partitioned Parquet
         7. Save quality report
     """
+    bronze_file = os.path.join(BRONZE_DATA_PATH, "events_raw.parquet")
+    raw_exists = os.path.exists(RAW_DATA_PATH) and os.path.isdir(RAW_DATA_PATH) and len(os.listdir(RAW_DATA_PATH)) > 0
+
+    if not raw_exists and os.path.exists(bronze_file):
+        logger.info("Raw data is missing but Bronze layer already exists. Skipping ingestion to save disk space.")
+        return
+
     spark = create_spark_session(app_name="Phase1_Ingestion")
 
     try:
         with ETLMetadataTracker("ingestion") as tracker:
             # Step 1: Read raw data
-            df = read_raw_csv(spark, RAW_DATA_PATH)
+            df = read_raw_parquet(spark, RAW_DATA_PATH)
 
             # Step 2: Validate schema
             quality_results = []
@@ -160,17 +164,18 @@ def run_ingestion() -> None:
 
             # Step 3: Validate row count (at least 1 row)
             row_result = validate_row_count(df, "bronze", min_rows=1)
+            row_count = row_result["actual_count"]
             quality_results.append(row_result)
 
-            # Step 4: Generate profiling report
-            profile = generate_profiling_report(df, "bronze")
+            # Step 4: Generate profiling report (pass row_count to optimize)
+            profile = generate_profiling_report(df, "bronze", row_count=row_count)
             quality_results.append(profile)
 
             # Step 5: Add ingestion metadata
             df = add_ingestion_metadata(df)
 
-            # Step 6: Write to Bronze layer
-            row_count = write_bronze(df, BRONZE_DATA_PATH)
+            # Step 6: Write to Bronze layer (pass row_count to optimize)
+            row_count = write_bronze(df, BRONZE_DATA_PATH, row_count)
             tracker.set_rows_processed(row_count)
 
             # Step 7: Save quality report

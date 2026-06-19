@@ -17,6 +17,7 @@ import logging
 import os
 import sys
 
+from pyspark import StorageLevel
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType, TimestampType
@@ -38,6 +39,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+BRONZE_DATA_PATH = os.getenv("BRONZE_DATA_PATH", "data/bronze")
 BRONZE_DATA_PATH = os.getenv("BRONZE_DATA_PATH", "data/bronze")
 SILVER_DATA_PATH = os.getenv("SILVER_DATA_PATH", "data/silver")
 
@@ -97,16 +99,8 @@ def handle_nulls(df: DataFrame) -> DataFrame:
 
     # Drop rows where critical fields are null (these rows are unusable)
     critical_cols = ["event_time", "user_id", "product_id"]
-    before_count = df.count()
     df = df.dropna(subset=critical_cols)
-    after_count = df.count()
-    dropped = before_count - after_count
-
-    if dropped > 0:
-        logger.warning("Dropped %s rows with null critical fields", f"{dropped:,}")
-    else:
-        logger.info("No rows dropped for null critical fields")
-
+    logger.info("Null handling completed")
     return df
 
 
@@ -153,13 +147,9 @@ def remove_duplicates(df: DataFrame) -> DataFrame:
     """
     logger.info("Removing duplicates...")
 
-    before_count = df.count()
     df = df.dropDuplicates()
-    after_count = df.count()
-    removed = before_count - after_count
 
-    logger.info("Deduplication: removed %s duplicates (%s → %s)",
-                f"{removed:,}", f"{before_count:,}", f"{after_count:,}")
+    logger.info("Duplicate removal transformation queued")
     return df
 
 
@@ -187,7 +177,7 @@ def create_event_date(df: DataFrame) -> DataFrame:
     return df
 
 
-def write_silver(df: DataFrame, output_path: str) -> int:
+def write_silver(df: DataFrame, output_path: str) -> tuple[DataFrame, int]:
     """
     Write cleaned DataFrame to Silver layer as partitioned Parquet.
 
@@ -196,7 +186,7 @@ def write_silver(df: DataFrame, output_path: str) -> int:
         output_path: Silver layer output directory.
 
     Returns:
-        Number of rows written.
+        Tuple of (df_written, row_count).
 
     Design Decision:
         Partitioned by event_date for optimal query performance.
@@ -211,9 +201,11 @@ def write_silver(df: DataFrame, output_path: str) -> int:
 
     df.write.mode("overwrite").partitionBy("event_date").parquet(silver_path)
 
-    row_count = df.count()
+    df_written = df.sparkSession.read.parquet(silver_path)
+    row_count = df_written.count()
     logger.info("Silver layer written: %s rows", f"{row_count:,}")
-    return row_count
+    return df_written, row_count
+
 
 
 def run_cleaning() -> None:
@@ -246,25 +238,25 @@ def run_cleaning() -> None:
             df = remove_duplicates(df)
             df = create_event_date(df)
 
-            # Step 7: Validate cleaned data
+            # Step 8: Write to Silver layer (Write first to avoid repeating dropDuplicates on downstream operations)
+            df_written, row_count = write_silver(df, SILVER_DATA_PATH)
+            tracker.set_rows_processed(row_count)
+
+            # Step 7: Validate cleaned data using the already written and loaded DataFrame
             quality_results = []
-            row_result = validate_row_count(df, "silver", min_rows=1)
+            row_result = validate_row_count(df_written, "silver", min_rows=1)
             quality_results.append(row_result)
 
             null_result = validate_nulls(
-                df,
+                df_written,
                 critical_columns=["event_time", "user_id", "product_id"],
                 stage_name="silver",
                 fail_on_nulls=True,
             )
             quality_results.append(null_result)
 
-            profile = generate_profiling_report(df, "silver")
+            profile = generate_profiling_report(df_written, "silver", row_count=row_count)
             quality_results.append(profile)
-
-            # Step 8: Write to Silver layer
-            row_count = write_silver(df, SILVER_DATA_PATH)
-            tracker.set_rows_processed(row_count)
 
             save_quality_report(quality_results, "silver")
 

@@ -138,17 +138,6 @@ def resolve_product_sk(
     # Drop temporary join columns
     joined = joined.drop("scd2_product_id", "valid_from", "valid_to")
 
-    # Log join quality
-    total = joined.count()
-    unmatched = joined.filter(F.col("product_sk").isNull()).count()
-    if unmatched > 0:
-        logger.warning(
-            "Temporal join: %s/%s events have no matching product version",
-            f"{unmatched:,}", f"{total:,}",
-        )
-    else:
-        logger.info("Temporal join: all %s events matched", f"{total:,}")
-
     return joined
 
 
@@ -184,13 +173,10 @@ def build_fact_events(df: DataFrame) -> DataFrame:
         "user_session",
         "event_date",
     )
-
-    count = fact.count()
-    logger.info("fact_events built: %s rows", f"{count:,}")
     return fact
 
 
-def write_fact_events(df: DataFrame, output_path: str) -> int:
+def write_fact_events(df: DataFrame, output_path: str) -> tuple[DataFrame, int]:
     """
     Write fact_events to Gold layer, partitioned by event_date.
 
@@ -199,7 +185,7 @@ def write_fact_events(df: DataFrame, output_path: str) -> int:
         output_path: Gold layer output directory.
 
     Returns:
-        Number of rows written.
+        Tuple of (df_written, row_count).
 
     Design Decision:
         Partitioned by event_date because:
@@ -212,9 +198,10 @@ def write_fact_events(df: DataFrame, output_path: str) -> int:
 
     df.write.mode("overwrite").partitionBy("event_date").parquet(fact_path)
 
-    row_count = df.count()
+    df_written = df.sparkSession.read.parquet(fact_path)
+    row_count = df_written.count()
     logger.info("fact_events written: %s rows", f"{row_count:,}")
-    return row_count
+    return df_written, row_count
 
 
 def run_fact_events() -> None:
@@ -252,22 +239,32 @@ def run_fact_events() -> None:
             # Step 5: Build fact table
             fact = build_fact_events(events)
 
-            # Step 6: Validate
+            # Step 6: Write first to avoid repeating temporal join shuffles
+            fact_written, row_count = write_fact_events(fact, GOLD_DATA_PATH)
+            tracker.set_rows_processed(row_count)
+
+            # Log join quality on the written DataFrame (efficient)
+            unmatched = fact_written.filter(F.col("product_sk").isNull()).count()
+            if unmatched > 0:
+                logger.warning(
+                    "Temporal join: %s/%s events have no matching product version",
+                    f"{unmatched:,}", f"{row_count:,}",
+                )
+            else:
+                logger.info("Temporal join: all %s events matched", f"{row_count:,}")
+
+            # Step 7: Validate
             quality_results = []
-            row_result = validate_row_count(fact, "fact_events", min_rows=1)
+            row_result = validate_row_count(fact_written, "fact_events", min_rows=1)
             quality_results.append(row_result)
 
             null_result = validate_nulls(
-                fact,
+                fact_written,
                 critical_columns=["event_id", "user_id", "event_time"],
                 stage_name="fact_events",
                 fail_on_nulls=True,
             )
             quality_results.append(null_result)
-
-            # Write
-            row_count = write_fact_events(fact, GOLD_DATA_PATH)
-            tracker.set_rows_processed(row_count)
 
             save_quality_report(quality_results, "fact_events")
             logger.info("Fact events pipeline completed successfully")

@@ -104,8 +104,7 @@ def extract_product_timeline(df: DataFrame) -> DataFrame:
         )
     )
 
-    count = product_versions.count()
-    logger.info("Product versions extracted: %s records", f"{count:,}")
+    logger.info("Product versions timeline extraction defined")
     return product_versions
 
 
@@ -215,16 +214,11 @@ def detect_changes_and_build_scd2(df: DataFrame) -> DataFrame:
         "is_current",
     )
 
-    count = result.count()
-    current_count = result.filter(F.col("is_current")).count()
-    logger.info(
-        "SCD2 built: %s total versions, %s current products",
-        f"{count:,}", f"{current_count:,}",
-    )
+    logger.info("SCD2 build logic defined")
     return result
 
 
-def write_dim_products_scd2(df: DataFrame, output_path: str) -> int:
+def write_dim_products_scd2(df: DataFrame, output_path: str) -> tuple[DataFrame, int]:
     """
     Write SCD Type 2 dimension to Gold layer.
 
@@ -236,16 +230,18 @@ def write_dim_products_scd2(df: DataFrame, output_path: str) -> int:
         output_path: Gold layer output directory.
 
     Returns:
-        Number of rows written.
+        Tuple of (df_written, row_count).
     """
     dim_path = os.path.join(output_path, "dim_products_scd2.parquet")
     logger.info("Writing dim_products_scd2 to: %s", dim_path)
 
     df.write.mode("overwrite").parquet(dim_path)
 
-    row_count = df.count()
+    df_written = df.sparkSession.read.parquet(dim_path)
+    row_count = df_written.count()
     logger.info("dim_products_scd2 written: %s rows", f"{row_count:,}")
-    return row_count
+    return df_written, row_count
+
 
 
 def run_dim_products_scd2() -> None:
@@ -273,17 +269,17 @@ def run_dim_products_scd2() -> None:
             # Build SCD Type 2
             scd2 = detect_changes_and_build_scd2(product_versions)
 
+            # Write first to avoid repeating window function shuffles
+            scd2_written, row_count = write_dim_products_scd2(scd2, GOLD_DATA_PATH)
+            tracker.set_rows_processed(row_count)
+
             # Validate
             quality_results = []
-            row_result = validate_row_count(scd2, "dim_products_scd2", min_rows=1)
+            row_result = validate_row_count(scd2_written, "dim_products_scd2", min_rows=1)
             quality_results.append(row_result)
 
-            pk_result = validate_primary_key(scd2, "product_sk", "dim_products_scd2")
+            pk_result = validate_primary_key(scd2_written, "product_sk", "dim_products_scd2")
             quality_results.append(pk_result)
-
-            # Write
-            row_count = write_dim_products_scd2(scd2, GOLD_DATA_PATH)
-            tracker.set_rows_processed(row_count)
 
             save_quality_report(quality_results, "dim_products_scd2")
             logger.info("Phase 4 (SCD Type 2) completed successfully")

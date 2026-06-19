@@ -70,13 +70,10 @@ def build_dim_users(df: DataFrame) -> DataFrame:
         .withColumn("first_event_date", F.to_date(F.col("first_event_ts")))
         .select("user_id", "first_event_date", "first_event_ts")
     )
-
-    count = dim_users.count()
-    logger.info("dim_users built: %s unique users", f"{count:,}")
     return dim_users
 
 
-def write_dim_users(df: DataFrame, output_path: str) -> int:
+def write_dim_users(df: DataFrame, output_path: str) -> tuple[DataFrame, int]:
     """
     Write dim_users to Gold layer. NOT partitioned (small dimension table).
 
@@ -85,7 +82,7 @@ def write_dim_users(df: DataFrame, output_path: str) -> int:
         output_path: Gold layer output directory.
 
     Returns:
-        Number of rows written.
+        Tuple of (df_written, row_count).
     """
     dim_path = os.path.join(output_path, "dim_users.parquet")
     logger.info("Writing dim_users to: %s", dim_path)
@@ -94,9 +91,11 @@ def write_dim_users(df: DataFrame, output_path: str) -> int:
     # being read as a single file for broadcast joins.
     df.write.mode("overwrite").parquet(dim_path)
 
-    row_count = df.count()
+    df_written = df.sparkSession.read.parquet(dim_path)
+    row_count = df_written.count()
     logger.info("dim_users written: %s rows", f"{row_count:,}")
-    return row_count
+    return df_written, row_count
+
 
 
 def run_dim_users() -> None:
@@ -121,17 +120,17 @@ def run_dim_users() -> None:
             # Step 2: Build dimension
             dim_users = build_dim_users(df)
 
+            # Step 4: Write (Write first to avoid repeating aggregation shuffles)
+            dim_users_written, row_count = write_dim_users(dim_users, GOLD_DATA_PATH)
+            tracker.set_rows_processed(row_count)
+
             # Step 3: Validate
             quality_results = []
-            row_result = validate_row_count(dim_users, "dim_users", min_rows=1)
+            row_result = validate_row_count(dim_users_written, "dim_users", min_rows=1)
             quality_results.append(row_result)
 
-            pk_result = validate_primary_key(dim_users, "user_id", "dim_users")
+            pk_result = validate_primary_key(dim_users_written, "user_id", "dim_users")
             quality_results.append(pk_result)
-
-            # Step 4: Write
-            row_count = write_dim_users(dim_users, GOLD_DATA_PATH)
-            tracker.set_rows_processed(row_count)
 
             save_quality_report(quality_results, "dim_users")
             logger.info("Phase 3 (dim_users) completed successfully")
